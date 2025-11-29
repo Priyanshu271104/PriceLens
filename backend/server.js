@@ -1,3 +1,4 @@
+// backend/server.js
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -6,21 +7,23 @@ const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const app = express();
+
 const PORT = process.env.PORT || 5005;
 const SERP_API_KEY = process.env.SERP_API_KEY;
 
+// Fail fast if a required secret is missing (prevents runtime surprises)
 if (!SERP_API_KEY) {
-  return res
-    .status(500)
-    .json({ error: "Server misconfiguration: SERP_API_KEY not set.", code: "SERP_API_KEY_MISSING" });
+  console.error("FATAL: SERP_API_KEY environment variable is not set.");
+  process.exit(1);
 }
 
-
+// security middlewares
 app.use(helmet());
 
+// rate limiter (configurable via env)
 const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
+  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX) || 60,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -31,23 +34,31 @@ const FRONTEND_ORIGINS = (
   process.env.ALLOWED_ORIGINS || "http://localhost:5173,http://127.0.0.1:5173"
 )
   .split(",")
-  .map((s) => s.trim());
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 app.use(
   cors({
     origin: function (origin, callback) {
       if (!origin) {
-        console.info('[CORS] request with no Origin — allowing (server/CLI usage).');
+        console.info(
+          "[CORS] request with no Origin — allowing (server/CLI usage)."
+        );
         return callback(null, true);
       }
       if (FRONTEND_ORIGINS.includes(origin)) return callback(null, true);
-      return callback(new Error("CORS policy: This origin is not allowed"));
+      console.warn(`[CORS] blocked origin: ${origin}`);
+      return callback(
+        new Error("CORS policy: This origin is not allowed"),
+        false
+      );
     },
+    credentials: true,
   })
 );
 
-
-app.use(express.json());
+// limit JSON body size
+app.use(express.json({ limit: "50kb" }));
 app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
@@ -61,11 +72,6 @@ app.get("/api/search", async (req, res) => {
     return res
       .status(400)
       .json({ error: "Query too long (max 200 characters)." });
-  }
-  if (!SERP_API_KEY) {
-    return res
-      .status(500)
-      .json({ error: "Server misconfiguration: SERP_API_KEY not set." });
   }
 
   console.log(
@@ -166,24 +172,25 @@ app.get("/api/search", async (req, res) => {
       error.stack || error.message
     );
     if (error.response) {
-      console.error("[API] Upstream status:", error.response.status);
+      console.error(
+        "[API] Upstream status:",
+        error.response.status,
+        error.response.data || ""
+      );
       if (error.response.status === 401) {
         return res.status(401).json({ error: "Invalid SerpApi Key." });
       }
     }
-    // return a clear error to the client
     return res.status(502).json({ error: "Upstream search provider error." });
   }
 });
 
-// helper: extractPrice — more robust extraction for common formats
+// helpers
 function extractPrice(priceRaw) {
-  if (!priceRaw && priceRaw !== 0) return 0;
+  if (priceRaw === null || priceRaw === undefined) return 0;
   if (typeof priceRaw === "number") return Math.round(priceRaw);
 
-  // Try to find a first numeric-like token (handles "₹79,999", "79,999.00", "Rs. 79,999", etc.)
   const str = String(priceRaw);
-  // find groups of digits optionally with commas and optional decimal part
   const match = str.match(/[\d,]+(?:\.\d+)?/);
   if (!match) return 0;
   const numeric = match[0].replace(/,/g, "");
@@ -202,7 +209,6 @@ function getStoreInitials(name = "") {
 }
 
 function generateMockHistory(price = 0) {
-  // simple 3-point time series (2 months ago, 1 month ago, now)
   return [
     {
       date: new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString(),
@@ -216,6 +222,17 @@ function generateMockHistory(price = 0) {
   ];
 }
 
-app.listen(PORT, () => {
-  console.log(`Backend server running on http://localhost:${PORT}`);
+// start server
+const server = app.listen(PORT, () => {
+  console.log(`Backend server listening on port ${PORT}`);
+});
+
+// graceful shutdown
+process.on("SIGTERM", () => {
+  console.info("SIGTERM received: closing HTTP server");
+  server.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  console.info("SIGINT received: closing HTTP server");
+  server.close(() => process.exit(0));
 });
